@@ -1,0 +1,434 @@
+Index: Rakefile
+===================================================================
+--- Rakefile	(revision 23)
++++ Rakefile	(working copy)
+@@ -6,7 +6,7 @@
+ require 'rake/contrib/rubyforgepublisher'
+ 
+ PKG_NAME = 'simplemapper'
+-PKG_VERSION = "0.0.7"
++PKG_VERSION = "0.1.0"
+ 
+ PKG_FILES = FileList[
+     "lib/**/*", "rspec/**/*", "[A-Z]*", "Rakefile", "doc/**/*"
+Index: lib/simple_mapper/adapters/http_adapter.rb
+===================================================================
+--- lib/simple_mapper/adapters/http_adapter.rb	(revision 25)
++++ lib/simple_mapper/adapters/http_adapter.rb	(working copy)
+@@ -11,6 +11,7 @@
+ # Simply perform the requests, with callbacks, to the appropriate http host.
+ module SimpleMapper
+   class HttpAdapter
++    include Callbacks
+     attr_accessor :base_url
+     attr_accessor :raise_http_errors
+ 
+@@ -28,6 +29,14 @@
+     end
+     alias :set_headers :headers=
+ 
++    def request_options
++      @request_options ||= {}
++    end
++    def request_options=(options)
++      raise TypeError, "options must be a hash!" unless options.is_a?(Hash)
++      @request_options = options
++    end
++    alias :set_request_options :request_options=
+     def finder_options
+       @finder_options ||= {}
+     end
+@@ -45,45 +54,45 @@
+     end
+     alias :set_display_options :display_options=
+ 
+-    def get(options={})
+-      raw_get(base_uri.path + query_string_from_options(finder_options.merge(display_options.merge(options))))
++    def get(options={},request_options={})
++      raw_get(base_uri.path + query_string_from_options(finder_options.merge(display_options.merge(options))),request_options)
+     end
+ 
+-    def raw_get(url)
+-      begin
+-        http.request(request('get', url)).body
+-      rescue => e
+-        raise e if !!raise_http_errors
+-        nil
+-      end
++    def raw_get(url,request_options={})
++      do_http(
++        'get',
++        url,
++        nil,
++        request_options
++      )
+     end
+ 
+-    def put(identifier,data,options={})
+-      begin
+-        http.request(request('put', URI.parse(identifier).path + query_string_from_options(display_options.merge(options)), data)).body
+-      rescue => e
+-        raise e if !!raise_http_errors
+-        nil
+-      end
++    def put(identifier,data,options={},request_options={})
++      do_http(
++        'put',
++        URI.parse(identifier).path + query_string_from_options(display_options.merge(options)),
++        data,
++        request_options
++      )
+     end
+ 
+-    def post(data,options={})
+-      begin
+-        http.request(request('post', base_uri.path + query_string_from_options(display_options.merge(options)), data)).body
+-      rescue => e
+-        raise e if !!raise_http_errors
+-        nil
+-      end
++    def post(data,options={},request_options={})
++      do_http(
++        'post',
++        base_uri.path + query_string_from_options(display_options.merge(options)),
++        data,
++        request_options
++      )
+     end
+ 
+     # In the http adapter, the identifier is a url.
+-    def delete(identifier,options={})
+-      begin
+-        http.request(request('delete', URI.parse(identifier).path + query_string_from_options(options))).body
+-      rescue => e
+-        raise e if !!raise_http_errors
+-        nil
+-      end
++    def delete(identifier,options={},request_options={})
++      do_http(
++        'delete',
++        URI.parse(identifier).path + query_string_from_options(options),
++        nil,
++        request_options
++      )
+     end
+ 
+     private
+@@ -96,16 +105,94 @@
+         @http
+       end
+ 
+-      def request(verb,path,body=nil,options={})
++      def do_http(*args)
++        perform_request(make_request(*args))
++      end
++
++      def make_request(verb,path,body=nil,options={})
+         request_class = Net::HTTP.const_get verb.to_s.capitalize
+         request = request_class.new path
+         request.body = body
+         request.initialize_http_header headers.merge(options[:headers] || {})
+-        # - - - after_request_instantiate callback
+-        res = run_callback('initialize_request', request)
+-        request = res if res.is_a?(request.class)
++        add_arg_to_callback('initialize_request', :request_options, options)
++        # - - - initialize_request callback
++        req = run_callback('initialize_request', request)
++puts "Req Back: #{req.inspect}"
++        request = req if req.is_a?(request.class)
+         # - - -
+         request
+       end
++
++      def perform_request(request)
++        begin
++          http.request(request).body
++        rescue => e
++          raise e if !!raise_http_errors
++          nil
++        end
++      end
+   end
+ end
++
++
++class Net::HTTPRequest
++  def update_query_params(hash)
++    self.query_params = query_params.merge(hash)
++  end
++  alias :add_query_param :update_query_params
++
++  def query_params=(hash)
++    query = _query_params_to_query_string(hash)
++    @path = query ? @path.split('?')[0] + '?' + query : @path.split('?')[0]
++  end
++  def query_params
++    (@path.split('?')[1]||'').split(/[&;] */n).inject({}) { |h,p| 
++      _query_normalize_params(h, *_query_unescape(p).split('=',2))
++    }
++  end
++
++  private
++    def _query_params_to_query_string(value, prefix = nil)
++      case value
++      when Array
++        value.map { |v|
++          _query_params_to_query_string(v, "#{prefix}[]")
++        } * "&"
++      when Hash
++        value.map { |k, v|
++          _query_params_to_query_string(v, prefix ? "#{prefix}[#{_query_escape(k)}]" : _query_escape(k))
++        } * "&"
++      else
++        "#{prefix}=#{_query_escape(value)}"
++      end
++    end
++
++
++    def _query_escape(s)
++      s.to_s.gsub(/([^ a-zA-Z0-9_.-]+)/n) {
++        '%'+$1.unpack('H2'*$1.size).join('%').upcase
++      }.tr(' ', '+')
++    end
++
++    def _query_unescape(s)
++      s.tr('+', ' ').gsub(/((?:%[0-9a-fA-F]{2})+)/n){
++        [$1.delete('%')].pack('H*')
++      }
++    end
++  
++    def _query_normalize_params(parms, name, val=nil)
++      name =~ %r([\[\]]*([^\[\]]+)\]*)
++      key = $1 || ''
++      after = $' || ''
++      
++      if after == ""
++        parms[key] = val
++      elsif after == "[]"
++        (parms[key] ||= []) << val
++      else
++        parms[key] ||= {}
++        parms[key] = _query_normalize_params(parms[key], after, val)
++      end
++      parms
++    end
++end
+Index: lib/simple_mapper/default_plugins/callbacks.rb
+===================================================================
+--- lib/simple_mapper/default_plugins/callbacks.rb	(revision 22)
++++ lib/simple_mapper/default_plugins/callbacks.rb	(working copy)
+@@ -1,17 +1,38 @@
++def add_callback(name,&block)
++  SimpleMapper::Callbacks[name] << block
++end
++def add_arg_to_callback(name, argname, arg)
++  SimpleMapper::Callbacks.callback_options[name][argname] = arg
++end
++def clear_args_from_callback(name)
++  SimpleMapper::Callbacks.callback_options[name].clear
++end
++def run_callback(name, *args)
++  len = args.length
++  ret = SimpleMapper::Callbacks[name].inject(args << SimpleMapper::Callbacks.callback_options[name]) do |args,cb|
++    r = cb.call(*args)
++    re = r ? (r.is_a?(Array) ? r : [r]) : []
++    re + args[re.length..-1]
++  end
++  clear_args_from_callback(name)
++  rett = ret[0..len-1] # except for the options
++  rett.length == 1 ? rett[0] : rett
++end
++
+ module SimpleMapper
+-  module CallbacksExtension
+-    def callbacks
+-      @callbacks ||= Hash.new {|h,k| h[k] = []}
++  module Callbacks
++    class << self
++      def [](name)
++        callbacks[name]
++      end
++
++      def callbacks
++        @callbacks ||= Hash.new {|h,k| h[k] = []}
++      end
++
++      def callback_options
++        @callback_options ||= Hash.new {|h,k| h[k] = {}}
++      end
+     end
+-    def add_callback(name,&block)
+-      callbacks[name] << block
+-    end
+-    def run_callback(name, *args)
+-      args = args.first if args.length == 1
+-      callbacks[name].inject(args) {|args,cb| cb.call(*args) || args}
+-    end
+   end
+-  class HttpAdapter
+-    include CallbacksExtension
+-  end
+ end
+Index: lib/simple_mapper/default_plugins/oauth.rb
+===================================================================
+--- lib/simple_mapper/default_plugins/oauth.rb	(revision 26)
++++ lib/simple_mapper/default_plugins/oauth.rb	(working copy)
+@@ -53,7 +53,8 @@
+ 
+       def set_oauth(controller)
+         @oauth = OAuthController.new(controller, self, @consumer_key, @consumer_secret, @oauth_options)
+-        add_callback('initialize_request') do |request|
++        add_callback('initialize_request') do |request,request_options|
++puts "Request: #{request.inspect}, Options: #{request_options.inspect}"
+           @oauth.authenticate! if !@oauth.authorized? && @oauth.scriptable?
+           raise RuntimeError, "Must authorize OAuth before attempting to get data from the provider." unless @oauth.authorized?
+           @oauth.request_signed!(request)
+Index: lib/simple_mapper/persistence.rb
+===================================================================
+--- lib/simple_mapper/persistence.rb	(revision 25)
++++ lib/simple_mapper/persistence.rb	(working copy)
+@@ -16,6 +16,16 @@
+       def debug?; @debug end
+       def debug!; @debug = true end
+ 
++      def options
++        @options ||= {}
++      end
++      def get_option(name)
++        options[name]
++      end
++      def set_option(name,value)
++        options[name] = value
++      end
++
+       def connection_adapters
+         @connection_adapters ||= Hash.new {|h,k| h[k] = {}}
+       end
+@@ -53,10 +63,16 @@
+       alias :set_format :format=
+       attr_reader :format_name
+ 
++      def entity_name
++        @entity_name ||= name.underscore.split('/')[-1]
++      end
++      attr_writer :entity_name
++      alias :set_entity_name :entity_name=
++
+       def connections
+-        @connections ||= {}
++        Thread.current['connections'] ||= {}
+       end
+-      def connection(name=:default,refresh=false)
++      def connection(name=:default,refresh=false,&block)
+         connections[name] = begin
+           # Initialize the connection with the connection adapter.
+           raise ArgumentError, "Must include :adapter!" unless connection_adapters[name][:adapter].to_s.camelize.length > 0
+@@ -66,6 +82,7 @@
+           adapter.debug! if connection_adapters[name][:debug]
+           adapter
+         end if !connections[name] || refresh
++        block.in_context(adapter).call if block_given?
+         connections[name]
+       end
+ 
+@@ -76,11 +93,13 @@
+         adapter = adapter_from_args(*args)
+         objs = extract_from(connection(adapter || :default).get(*args))
+         if objs.is_a?(Array)
+-          safe = 1
+-          while(objs[-1].respond_to?(:meta) && objs[-1].meta['total'] > objs.length && objs[-1].meta['next'])
+-            safe += 1
+-            objs.concat(extract_from(connection(adapter || :default).raw_get(objs[-1].meta['next'])))
+-            break if safe >= 50 # Safeguard, if we do 20 requests we're probably on a runaway. Paginating at 50/page would be 2500 records...
++          if options[:follow_auto_pagination]
++            safe = 1
++            while(objs[-1].respond_to?(:meta) && objs[-1].meta['total'] > objs.length && objs[-1].meta['next'])
++              safe += 1
++              objs.concat(extract_from(connection(adapter || :default).raw_get(objs[-1].meta['next'])))
++              break if safe >= 50 # Safeguard, if we do 20 requests we're probably on a runaway. Paginating at 50/page would be 2500 records...
++            end
+           end
+           objs.each {|e| e.instance_variable_set(:@adapter, adapter)} if adapter
+         else
+@@ -172,6 +191,7 @@
+ 
+     # sends a put request with self.data
+     def put(*args)
++      add_arg_to_callback('initialize_request', :instance, self)
+       new_rec = self.class.extract_one(self.class.connection(@adapter || :default).put(identifier, formatted_data, *args), identifier)
+       raise "Request did not return an object" if new_rec.nil?
+       self.data = new_rec.to_hash
+@@ -180,6 +200,7 @@
+ 
+     # sends a post request with self.data
+     def post(*args)
++      add_arg_to_callback('initialize_request', :instance, self)
+       new_rec = self.class.extract_one(self.class.connection(@adapter || :default).post(formatted_data, *args))
+       raise "Request did not return an object" if new_rec.nil?
+       self.data = new_rec.to_hash
+@@ -189,6 +210,7 @@
+ 
+     # delete
+     def delete
++      add_arg_to_callback('initialize_request', :instance, self)
+       if self.class.connection(@adapter || :default).delete(identifier)
+         @persisted = false
+         instance_variable_set('@'+self.class.identifier, nil)
+Index: lib/simple_mapper/formats/json_format.rb
+===================================================================
+--- lib/simple_mapper/formats/json_format.rb	(revision 22)
++++ lib/simple_mapper/formats/json_format.rb	(working copy)
+@@ -1,3 +1,4 @@
++require 'json'
+ require 'simple_mapper/support/bliss_serializer'
+ require 'rubygems'
+ gem 'formattedstring'
+@@ -32,29 +33,26 @@
+         doc = Serialize.hash_from_json(json)
+         # doc could include a single 'model' element, or a 'models' wrapper around several.
+         if doc.is_a?(Hash)
+-          puts "Top-level JSON key(s): #{doc.keys.inspect}" if @debug
+           # In contrast to XML, JSON is not restricted to one top-level key. We will assume the objects are in a hash/array
+           # referenced by either singular or plural of the klass.
+           meta = doc.dup
+-          if doc[self.name.underscore]
+-            key = self.name.underscore
+-          elsif doc[self.name.pluralize.underscore]
+-            key = self.name.pluralize.underscore
++          if doc[self.entity_name]
++            key = self.entity_name
++          elsif doc[self.entity_name.pluralize]
++            key = self.entity_name.pluralize
+           else
+             return nil
+           end
+           meta.delete(key) # removing the data leaves us only the meta information
+           meta.freeze
+           if doc[key].is_a?(Array)
+-            puts "Several objects returned under key '#{key}':" if @debug
+             doc[key].collect do |e|
+-              obj = Object.module_eval("::#{key.singularize.camelize}", __FILE__, __LINE__).load(e)
++              obj = self.load(e)
+               obj.instance_variable_set(:@meta, meta)
+               obj
+             end
+           else
+-            puts "Single object returned under key '#{key}':" if @debug
+-            obj = Object.module_eval("::#{key.singularize.camelize}", __FILE__, __LINE__).load(doc[key])
++            obj = self.load(doc[key])
+             obj.instance_variable_set(:@meta, meta)
+             obj
+           end
+Index: lib/simple_mapper/formats/xml_format.rb
+===================================================================
+--- lib/simple_mapper/formats/xml_format.rb	(revision 19)
++++ lib/simple_mapper/formats/xml_format.rb	(working copy)
+@@ -47,7 +47,7 @@
+               Object.module_eval("::#{key.singularize.camelize}", __FILE__, __LINE__).load(e)
+             end
+           elsif doc[key] # top-level must be single object
+-            Object.module_eval("::#{key.singularize.camelize}", __FILE__, __LINE__).load(doc[self.name.underscore])
++            Object.module_eval("::#{key.singularize.camelize}", __FILE__, __LINE__).load(doc[key])
+           else
+             nil
+           end
